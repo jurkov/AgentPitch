@@ -273,7 +273,8 @@
 #section-arena,
 #section-config,
 #section-cup,
-#section-league {
+#section-league,
+#section-admin {
   flex: 1;
   min-height: 0;
   display: flex;
@@ -288,7 +289,8 @@
 #section-arena[hidden],
 #section-config[hidden],
 #section-cup[hidden],
-#section-league[hidden] {
+#section-league[hidden],
+#section-admin[hidden] {
   display: none;
 }
 
