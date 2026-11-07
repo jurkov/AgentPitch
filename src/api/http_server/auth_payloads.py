@@ -34,6 +34,15 @@ class CreateUserPayload(BaseModel):
     password: str = Field(min_length=8, max_length=256)
     role: Literal["admin", "user"] = "user"
     must_change_password: bool = True
+    # Required contact email. Format + uniqueness are enforced in user_store;
+    # min_length=1 here rejects an empty string at the HTTP boundary.
+    email: str = Field(min_length=1, max_length=254)
+
+
+class SetEmailPayload(BaseModel):
+    """Change a user's email. Required (a user must always have an email)."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    email: str = Field(min_length=1, max_length=254)
 
 
 class SetRolePayload(BaseModel):

@@ -33,6 +33,22 @@ async function _api(path, opts = {}) {
   return { ok: res.ok, status: res.status, body };
 }
 
+// Turn a FastAPI error body into a human string. `detail` can be a plain
+// string (our HTTPException raises) OR an array of validation-error objects
+// (Pydantic 422). Rendering the array directly gave "[object Object]"; this
+// flattens it to readable text.
+function _detailText(body, fallback = 'Request failed.') {
+  if (!body || body.detail == null) return fallback;
+  const d = body.detail;
+  if (typeof d === 'string') return d;
+  if (Array.isArray(d)) {
+    return d.map(e => (e && e.msg) ? e.msg : (typeof e === 'string' ? e : JSON.stringify(e)))
+            .join('; ') || fallback;
+  }
+  if (typeof d === 'object') return d.msg || JSON.stringify(d);
+  return String(d);
+}
+
 function _state() {
   return window.authState || { user: null, teams: [], isTeamLead: false };
 }
@@ -45,10 +61,15 @@ function _username(userId) {
 // ── data loading ────────────────────────────────────────────────
 
 async function _loadData() {
-  // Teams are readable by any logged-in user; users list is admin-only.
-  const teamsReq = _api('/api/teams');
-  const usersReq = _isAdmin() ? _api('/api/users') : Promise.resolve({ ok: true, body: { users: [] } });
-  const [teamsRes, usersRes] = await Promise.all([teamsReq, usersReq]);
+  // Both calls are attempted unconditionally — the SERVER is the authority on
+  // authorization (/api/users is admin-only and returns 401/403 otherwise).
+  // We must NOT gate on the client-side role here: on a fresh page reload
+  // window.authState may not be populated yet, which previously left the
+  // lists empty. A 401/403 simply yields an empty users list.
+  const [teamsRes, usersRes] = await Promise.all([
+    _api('/api/teams'),
+    _api('/api/users'),
+  ]);
   _teamsCache = (teamsRes.ok && teamsRes.body && teamsRes.body.teams) || [];
   _usersCache = (usersRes.ok && usersRes.body && usersRes.body.users) || [];
 }
@@ -80,6 +101,9 @@ function _renderUsersPanel() {
       : '<span class="dimer">no teams</span>';
     const leadBadge = (u.leads && u.leads.length)
       ? ` · leads ${u.leads.map(_esc).join(', ')}` : '';
+    const emailLabel = u.email
+      ? _esc(u.email)
+      : '<span class="dimer">no email</span>';
     return `
       <div class="list-row" data-user-id="${_esc(u.id)}">
         <div class="list-row-content">
@@ -87,13 +111,14 @@ function _renderUsersPanel() {
             ${_esc(u.username)}
             <span class="admin-role-tag admin-role-${_esc(u.role)}">${_esc(u.role)}</span>
           </div>
-          <div class="list-row-line-2">${teamLabel}${leadBadge}</div>
+          <div class="list-row-line-2">${emailLabel} · ${teamLabel}${leadBadge}</div>
         </div>
         <div class="list-row-actions">
           <select class="sel admin-role-sel" data-user-id="${_esc(u.id)}" aria-label="Role for ${_esc(u.username)}">
             <option value="user" ${u.role === 'user' ? 'selected' : ''}>user</option>
             <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>admin</option>
           </select>
+          <button class="btn btn-sm" data-action="edit-email" data-user-id="${_esc(u.id)}">Email</button>
           <button class="btn btn-sm" data-action="reset-pw" data-user-id="${_esc(u.id)}">Reset PW</button>
           <button class="btn btn-sm btn-danger" data-action="del-user" data-user-id="${_esc(u.id)}">Delete</button>
         </div>
@@ -106,6 +131,7 @@ function _renderUsersPanel() {
 
       <div class="admin-create-row">
         <input class="ipt" id="admin-new-username" placeholder="username" autocomplete="off" spellcheck="false">
+        <input class="ipt" id="admin-new-email" type="email" placeholder="email (required)" autocomplete="off" spellcheck="false" required>
         <input class="ipt" id="admin-new-password" type="password" placeholder="password (min 8)" autocomplete="new-password">
         <select class="sel" id="admin-new-role">
           <option value="user" selected>user</option>
@@ -129,8 +155,8 @@ function _renderTeamsPanel(teams, admin) {
 
       ${admin ? `
       <div class="admin-create-row">
-        <input class="ipt" id="admin-new-team-slug" placeholder="slug (a-z0-9-_)" autocomplete="off" spellcheck="false">
-        <input class="ipt" id="admin-new-team-name" placeholder="Display name">
+        <input class="ipt" id="admin-new-team-name" placeholder="Display name (e.g. My Team)">
+        <input class="ipt" id="admin-new-team-slug" placeholder="slug (optional — auto from name)" autocomplete="off" spellcheck="false">
         <button class="btn btn-primary" id="admin-create-team-btn">+ Create team</button>
       </div>
       <div id="admin-team-error" class="form-error" hidden role="alert"></div>
@@ -228,14 +254,19 @@ function _wire(admin) {
 async function _createUser() {
   _err('admin-user-error', '');
   const username = document.getElementById('admin-new-username').value.trim();
+  const email = document.getElementById('admin-new-email').value.trim();
   const password = document.getElementById('admin-new-password').value;
   const role = document.getElementById('admin-new-role').value;
-  if (!username || !password) { _err('admin-user-error', 'Username and password are required.'); return; }
+  if (!username || !password || !email) {
+    _err('admin-user-error', 'Username, email and password are all required.');
+    return;
+  }
+  const payload = { username, email, password, role, must_change_password: true };
   const { ok, body } = await _api('/api/users', {
     method: 'POST',
-    body: JSON.stringify({ username, password, role, must_change_password: true }),
+    body: JSON.stringify(payload),
   });
-  if (!ok) { _err('admin-user-error', (body && body.detail) || 'Could not create user.'); return; }
+  if (!ok) { _err('admin-user-error', _detailText(body, 'Could not create user.')); return; }
   await _reload();
 }
 
@@ -245,19 +276,36 @@ async function _changeRole(e) {
   const { ok, body } = await _api(`/api/users/${userId}/role`, {
     method: 'PUT', body: JSON.stringify({ role }),
   });
-  if (!ok) { _err('admin-user-error', (body && body.detail) || 'Could not change role.'); await _reload(); return; }
+  if (!ok) { _err('admin-user-error', _detailText(body, 'Could not change role.')); await _reload(); return; }
   await _reload();
+}
+
+// Turn arbitrary user input into a server-valid slug (^[a-z0-9_-]+$):
+// lowercase, spaces/invalid chars → hyphens, collapse repeats, trim ends.
+function _slugify(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
 }
 
 async function _createTeam() {
   _err('admin-team-error', '');
-  const slug = document.getElementById('admin-new-team-slug').value.trim();
-  const name = document.getElementById('admin-new-team-name').value.trim();
-  if (!slug || !name) { _err('admin-team-error', 'Slug and name are required.'); return; }
+  const nameEl = document.getElementById('admin-new-team-name');
+  const slugEl = document.getElementById('admin-new-team-slug');
+  const name = nameEl.value.trim();
+  // If the slug field is blank, derive it from the name. Either way, sanitize
+  // so a natural-language entry ("My Team") becomes a valid slug ("my-team")
+  // instead of hitting a 422 the user can't easily interpret.
+  const rawSlug = slugEl.value.trim() || name;
+  const slug = _slugify(rawSlug);
+  if (!name) { _err('admin-team-error', 'Team name is required.'); return; }
+  if (!slug) { _err('admin-team-error', 'Could not derive a valid slug — use letters, numbers, - or _.'); return; }
   const { ok, body } = await _api('/api/teams', {
     method: 'POST', body: JSON.stringify({ slug, name }),
   });
-  if (!ok) { _err('admin-team-error', (body && body.detail) || 'Could not create team.'); return; }
+  if (!ok) { _err('admin-team-error', _detailText(body, 'Could not create team.')); return; }
   await _reload();
 }
 
@@ -268,7 +316,7 @@ async function _addMember(e) {
   const { ok, body } = await _api(`/api/teams/${slug}/members`, {
     method: 'POST', body: JSON.stringify({ user_id: userId }),
   });
-  if (!ok) { _err('admin-team-error', (body && body.detail) || 'Could not add member.'); }
+  if (!ok) { _err('admin-team-error', _detailText(body, 'Could not add member.')); }
   await _reload();
 }
 
@@ -289,6 +337,19 @@ async function _handleAction(e) {
       if (!pw) return;
       res = await _api(`/api/users/${userId}/password`, {
         method: 'PUT', body: JSON.stringify({ new_password: pw, must_change_password: true }),
+      });
+      break;
+    }
+    case 'edit-email': {
+      const current = (_usersCache.find(u => u.id === userId) || {}).email || '';
+      const email = prompt('New email for this user:', current);
+      if (email === null) return;            // cancelled
+      if (!email.trim()) {                   // email is required
+        _err('admin-user-error', 'Email cannot be empty.');
+        return;
+      }
+      res = await _api(`/api/users/${userId}/email`, {
+        method: 'PUT', body: JSON.stringify({ email: email.trim() }),
       });
       break;
     }
@@ -313,7 +374,7 @@ async function _handleAction(e) {
   if (res && !res.ok) {
     const where = (action.includes('team') || action === 'remove-member'
       || action === 'promote' || action === 'demote') ? 'admin-team-error' : 'admin-user-error';
-    _err(where, (res.body && res.body.detail) || 'Action failed.');
+    _err(where, _detailText(res.body, 'Action failed.'));
   }
   await _reload();
 }
@@ -324,6 +385,16 @@ const ALL_SECTION_IDS = [
   'section-matches', 'section-strategies', 'section-arena',
   'section-config', 'section-cup', 'section-league', 'section-admin',
 ];
+
+// Ensure window.authState is populated before we decide admin-vs-lead layout.
+// On a hard reload the section can activate before auth-ui's async
+// /api/auth/me has resolved — so if the role is unknown, resolve it now.
+async function _ensureAuthReady() {
+  if (window.authState && window.authState.user) return;
+  if (window.authUI && typeof window.authUI.refresh === 'function') {
+    try { await window.authUI.refresh(); } catch (_) {}
+  }
+}
 
 window.adminSection = {
   async activate() {
@@ -336,6 +407,7 @@ window.adminSection = {
     const root = ADMIN_ROOT();
     if (root) root.innerHTML = '<div class="section-placeholder">Loading…</div>';
     try {
+      await _ensureAuthReady();
       await _loadData();
       render();
     } catch (err) {
@@ -348,5 +420,14 @@ window.adminSection = {
     if (el) el.setAttribute('hidden', '');
   },
 };
+
+// If auth resolves a moment after the admin section already rendered (reload
+// race), re-render so the correct admin/lead view + lists show up.
+window.addEventListener('auth:ready', () => {
+  const sec = document.getElementById('section-admin');
+  if (sec && !sec.hasAttribute('hidden')) {
+    _loadData().then(render).catch(() => {});
+  }
+});
 
 console.log('[admin.js] loaded');

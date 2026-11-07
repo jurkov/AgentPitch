@@ -66,6 +66,14 @@ class WeakPasswordError(UserStoreError):
     """Password failed the minimum policy check."""
 
 
+class InvalidEmailError(UserStoreError):
+    """Email failed format validation."""
+
+
+class EmailAlreadyExistsError(UserStoreError):
+    """Another user already uses this email address."""
+
+
 class UserStoreWriteError(UserStoreError):
     """Filesystem error during a write or delete."""
 
@@ -76,8 +84,13 @@ class UserStoreWriteError(UserStoreError):
 
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+# Deliberately pragmatic email check (not full RFC 5322): one @, a dot in the
+# domain, no spaces. Good enough to catch typos without rejecting valid
+# addresses. Max length guards the store.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _VALID_ROLES = frozenset({"admin", "user"})
 MIN_PASSWORD_LEN = 8
+MAX_EMAIL_LEN = 254
 
 # Shared argon2 hasher. Defaults (argon2id, sensible time/memory cost) are
 # fine for a small self-hosted tool; kept here so hash + verify always use
@@ -99,6 +112,9 @@ class User:
     password_hash: str
     created_at: str
     must_change_password: bool = False
+    # Optional contact email. None for legacy accounts created before the
+    # field existed; validated + unique (case-insensitive) when present.
+    email: str | None = None
 
     def to_public_dict(self) -> dict:
         """JSON-friendly dict WITHOUT the password hash — safe for HTTP."""
@@ -148,6 +164,24 @@ def _validate_role(role: str) -> None:
         )
 
 
+def _normalize_email(email: str | None) -> str | None:
+    """Trim + lowercase an email, or return None for empty/None.
+
+    Empty string is treated as "no email" so the UI can clear the field by
+    sending "".
+    """
+    if email is None:
+        return None
+    e = email.strip().lower()
+    return e or None
+
+
+def _validate_email(email: str | None) -> None:
+    """Validate a NON-None, non-empty email. (None/empty is allowed upstream.)"""
+    if not isinstance(email, str) or len(email) > MAX_EMAIL_LEN or not _EMAIL_RE.fullmatch(email):
+        raise InvalidEmailError(f"Invalid email address: {email!r}")
+
+
 # ---------------------------------------------------------------------------
 # (De)serialization
 # ---------------------------------------------------------------------------
@@ -165,6 +199,7 @@ def _user_from_dict(data: dict) -> User:
         password_hash=data["password_hash"],
         created_at=data["created_at"],
         must_change_password=bool(data.get("must_change_password", False)),
+        email=data.get("email"),
     )
 
 
@@ -258,6 +293,30 @@ def username_exists(data_home: Path | str, username: str) -> bool:
         return False
 
 
+def get_user_by_email(data_home: Path | str, email: str) -> User:
+    """Case-insensitive email lookup. Raises if no user has that email."""
+    target = _normalize_email(email)
+    if target is None:
+        raise UserNotFoundError("Empty email")
+    for u in load_users(data_home):
+        if u.email and u.email.lower() == target:
+            return u
+    raise UserNotFoundError(f"No user with email {email!r}")
+
+
+def email_exists(data_home: Path | str, email: str, *, exclude_id: str | None = None) -> bool:
+    """True if `email` is already used by a user (optionally excluding one id)."""
+    target = _normalize_email(email)
+    if target is None:
+        return False
+    for u in load_users(data_home):
+        if exclude_id is not None and u.id == exclude_id:
+            continue
+        if u.email and u.email.lower() == target:
+            return True
+    return False
+
+
 def count_users(data_home: Path | str) -> int:
     return len(load_users(data_home))
 
@@ -278,20 +337,33 @@ def create_user(
     role: str = "user",
     *,
     must_change_password: bool = False,
+    email: str | None = None,
 ) -> User:
-    """Create a new user. Raises on duplicate username or policy failure.
+    """Create a new user. Raises on duplicate username/email or policy failure.
 
-    Username uniqueness is case-insensitive. Returns the created User
-    (including hash — strip via `to_public_dict` before any HTTP response).
+    Username + email uniqueness are both case-insensitive. Email is optional;
+    when provided it is validated and normalized (trimmed + lowercased).
+    Returns the created User (including hash — strip via `to_public_dict`
+    before any HTTP response).
     """
     _validate_username(username)
     _validate_password(password)
     _validate_role(role)
 
+    # Email is REQUIRED for new accounts. (Legacy accounts created before this
+    # rule may still have email=None on disk — load_users tolerates that — but
+    # no new account can be created without a valid email.)
+    norm_email = _normalize_email(email)
+    if norm_email is None:
+        raise InvalidEmailError("Email is required")
+    _validate_email(norm_email)
+
     users = load_users(data_home)
     lowered = username.lower()
     if any(u.username.lower() == lowered for u in users):
         raise UserAlreadyExistsError(f"Username {username!r} already taken")
+    if norm_email is not None and any(u.email and u.email.lower() == norm_email for u in users):
+        raise EmailAlreadyExistsError(f"Email {norm_email!r} already in use")
 
     user = User(
         id=uuid.uuid4().hex,
@@ -300,10 +372,46 @@ def create_user(
         password_hash=_hasher.hash(password),
         created_at=_now_iso(),
         must_change_password=must_change_password,
+        email=norm_email,
     )
     users.append(user)
     _save_users(data_home, users)
     return user
+
+
+def set_email(data_home: Path | str, user_id: str, email: str) -> User:
+    """Set a user's email (required — cannot be cleared). Returns updated user.
+
+    Validates format and case-insensitive uniqueness (excluding the user
+    themselves). Raises UserNotFoundError / InvalidEmailError /
+    EmailAlreadyExistsError.
+    """
+    norm_email = _normalize_email(email)
+    if norm_email is None:
+        raise InvalidEmailError("Email is required")
+    _validate_email(norm_email)
+    if email_exists(data_home, norm_email, exclude_id=user_id):
+        raise EmailAlreadyExistsError(f"Email {norm_email!r} already in use")
+
+    users = load_users(data_home)
+    updated: User | None = None
+    for i, u in enumerate(users):
+        if u.id == user_id:
+            updated = User(
+                id=u.id,
+                username=u.username,
+                role=u.role,
+                password_hash=u.password_hash,
+                created_at=u.created_at,
+                must_change_password=u.must_change_password,
+                email=norm_email,
+            )
+            users[i] = updated
+            break
+    if updated is None:
+        raise UserNotFoundError(f"No user with id {user_id!r}")
+    _save_users(data_home, users)
+    return updated
 
 
 def delete_user(data_home: Path | str, user_id: str) -> None:
@@ -329,6 +437,7 @@ def set_role(data_home: Path | str, user_id: str, role: str) -> User:
                 password_hash=u.password_hash,
                 created_at=u.created_at,
                 must_change_password=u.must_change_password,
+                email=u.email,
             )
             users[i] = updated
             break
@@ -358,6 +467,7 @@ def set_password(
                 password_hash=_hasher.hash(new_password),
                 created_at=u.created_at,
                 must_change_password=must_change_password,
+                email=u.email,
             )
             users[i] = updated
             break
@@ -401,6 +511,7 @@ def verify_password(data_home: Path | str, username: str, password: str) -> User
                         password_hash=_hasher.hash(password),
                         created_at=u.created_at,
                         must_change_password=u.must_change_password,
+                        email=u.email,
                     )
                     break
             _save_users(data_home, users)

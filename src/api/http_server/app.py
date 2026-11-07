@@ -92,6 +92,7 @@ from src.api.http_server.auth_payloads import (
     ChangePasswordPayload,
     CreateUserPayload,
     SetRolePayload,
+    SetEmailPayload,
     AdminResetPasswordPayload,
     CreateTeamPayload,
     RenameTeamPayload,
@@ -816,9 +817,15 @@ def _bootstrap_admin(data_home: Path) -> None:
         env_pw = _secrets.token_urlsafe(16)
         generated = True
 
+    # Email is required for all accounts now. Use AGENTPITCH_ADMIN_EMAIL if
+    # provided, else a clearly-placeholder address the operator can change in
+    # the Admin UI after first login.
+    admin_email = os.environ.get("AGENTPITCH_ADMIN_EMAIL", "").strip() or "admin@example.com"
+
     try:
         user_store.create_user(
-            data_home, "admin", env_pw, role="admin", must_change_password=True
+            data_home, "admin", env_pw, role="admin", must_change_password=True,
+            email=admin_email,
         )
     except user_store.UserStoreError as exc:
         print(f"[bootstrap] WARN: could not create admin account ({exc})", flush=True)
@@ -1224,10 +1231,14 @@ def create_app(log_dir: str = "./logs", seed_defaults: bool = True, require_auth
             user = user_store.create_user(
                 data_home, payload.username, payload.password,
                 role=payload.role, must_change_password=payload.must_change_password,
+                email=payload.email,
             )
         except user_store.UserAlreadyExistsError:
             raise HTTPException(status_code=409, detail="Username already exists")
-        except (user_store.InvalidUsernameError, user_store.WeakPasswordError) as e:
+        except user_store.EmailAlreadyExistsError:
+            raise HTTPException(status_code=409, detail="Email already in use")
+        except (user_store.InvalidUsernameError, user_store.WeakPasswordError,
+                user_store.InvalidEmailError) as e:
             raise HTTPException(status_code=400, detail=str(e))
         except user_store.UserStoreError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -1320,6 +1331,26 @@ def create_app(log_dir: str = "./logs", seed_defaults: bool = True, require_auth
             raise HTTPException(status_code=400, detail=str(e))
         session_store.destroy_user_sessions(data_home, user_id)
         return JSONResponse({"ok": True})
+
+    @app.put("/api/users/{user_id}/email")
+    async def set_user_email_endpoint(
+        user_id: str, payload: SetEmailPayload, request: Request,
+        _user=Depends(_auth.require_user),
+    ):
+        """Set/clear a user's email. Admins may edit anyone; a non-admin may
+        only edit their own. Send an empty string to clear it."""
+        data_home = Path(app.state.log_dir)
+        if _user.role != "admin" and _user.id != user_id:
+            raise HTTPException(status_code=403, detail="You can only change your own email")
+        try:
+            updated = user_store.set_email(data_home, user_id, payload.email)
+        except user_store.UserNotFoundError:
+            raise HTTPException(status_code=404, detail="User not found")
+        except user_store.EmailAlreadyExistsError:
+            raise HTTPException(status_code=409, detail="Email already in use")
+        except user_store.InvalidEmailError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return JSONResponse({"user": updated.to_public_dict()})
 
     # ── Team management ────────────────────────────────────────────────────
     # Create/delete/rename teams: admin only. Member/lead assignment within a

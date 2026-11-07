@@ -386,8 +386,8 @@ function initializeShell() {
   updateNavPinState();
   updateApiEndpoint();
 
-  // Set up periodic health checks (every 5 seconds)
-  healthCheckInterval = setInterval(checkHealth, 5000);
+  // Set up periodic health checks (every 30 seconds)
+  healthCheckInterval = setInterval(checkHealth, 30000);
 
   // Initial health check
   checkHealth();

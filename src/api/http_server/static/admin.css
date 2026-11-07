@@ -1,6 +1,19 @@
 /* Agent Pitch — Admin section styles. Design-system tokens only. */
 
+/* #section-admin is a flex column (see shell.css) that fills the body.
+   #admin-root must fill it and let .admin-wrap scroll, otherwise long
+   user/team lists get clipped by .section-body's overflow:hidden. */
+#section-admin > #admin-root {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .admin-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 8px;
